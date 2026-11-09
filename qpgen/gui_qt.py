@@ -1676,54 +1676,54 @@ class ManagerTab(QWidget):
         self._bump_idle_timer()
 
     def _run_integrity_guard(self) -> bool:
-        """
-        Run the integrity watchdog before unlocking the vault.
+        """Advisory local fingerprint check, not cryptographic attestation.
 
-        Returns True if everything is OK (or initialized),
-        False if a mismatch was detected and the caller should abort.
+        A mismatch never triggers automatic code or vault restoration. Users
+        must explicitly acknowledge the warning before an unlock attempt.
         """
-        if not hasattr(self, "integrity_guard") or self.integrity_guard is None:
-            # If the guard is not available, we fail open rather than
-            # locking the user out unexpectedly.
+        guard = getattr(self, "integrity_guard", None)
+        if guard is None:
+            self._set_integrity_status("disabled")
             return True
 
+        # A previous session's accepted warning does not carry over.
+        self._integrity_live_alerted = False
         header = self.vault.get_header_for_integrity()
-        ok, message = self.integrity_guard.verify(header)
+        try:
+            ok, message = guard.verify(header)
+        except Exception as exc:
+            ok, message = False, f"Local integrity check unavailable: {exc}"
+
         if ok:
-            # Optional: record a soft "integrity_ok" event
-            self._record_integrity_event("integrity_ok")
-            self._set_integrity_status("ok")
+            if "initialized" in message.lower():
+                self._set_integrity_status("idle")
+            else:
+                self._set_integrity_status("ok")
+            self._record_integrity_event("integrity_local_match")
             return True
 
-        # Integrity mismatch – offer to restore from backups
-        self._record_integrity_event("integrity_fail")
+        self._record_integrity_event("integrity_local_mismatch")
         self._set_integrity_status("alert", message)
-
         choice = QMessageBox.question(
             self,
-            "Vault integrity check failed",
-            "Vault integrity check failed.\n\n"
+            "Local integrity warning",
+            "The local code/vault fingerprint differs from its saved baseline.\n\n"
             f"{message}\n\n"
-            "If you did not intentionally modify the application or vault, "
-            "you can attempt to restore from the last known good backups of "
-            "the code and vault files.\n\n"
-            "Do you want to restore from backup now?",
+            "This is a locally writable comparison, NOT trusted attestation. "
+            "If the change was unexpected, cancel and reinstall the application "
+            "from a trusted source before entering your master password.\n\n"
+            "Continue with an authenticated unlock attempt? "
+            "No files will be restored automatically.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
-
         if choice == QMessageBox.Yes:
-            if self._restore_from_backups(header):
-                # Integrity passed after restore – allow the caller to continue.
-                return True
-
-        # If we reach here, either the user declined or restore failed.
-        self._show_error(
-            "Vault integrity check failed.\n\n"
-            f"{message}\n\n"
-            "Refusing to decrypt because the application or vault file "
-            "appears to have been modified."
-        )
+            # The stored baseline no longer matches; repeated polling would
+            # re-lock in 15 seconds. Disable baseline polling for this session
+            # and retain the visible alert until the next explicit unlock.
+            self._integrity_live_alerted = True
+            self._record_integrity_event("integrity_local_warning_accepted")
+            return True
         return False
 
     def _set_integrity_status(self, state: str, detail: str | None = None) -> None:
@@ -1742,7 +1742,7 @@ class ManagerTab(QWidget):
             text = "Integrity: idle"
             style = "color: #9ca3af; font-size: 11px;"
         elif state == "ok":
-            text = "Integrity: OK"
+            text = "Integrity: local match"
             style = "color: #10b981; font-size: 11px;"  # soft green
         else:  # "alert"
             short = (detail or "modified").strip()
@@ -1756,96 +1756,17 @@ class ManagerTab(QWidget):
         self.integrity_status_label.setStyleSheet(style)
 
     def _restore_from_backups(self, vault_header: dict) -> bool:
+        """Disabled: no automatic application-code or vault rollback on hash drift.
+
+        Vault rollback is available as an explicit authenticated operation
+        from the vault migration/recovery CLI with independent backup checks.
         """
-        Attempt to restore critical code files and the vault file
-        from their latest backups, then re-run the integrity check.
-
-        Returns True if restore succeeded and integrity now passes.
-        """
-        restored_any = False
-
-        guard = getattr(self, "integrity_guard", None)
-        if guard is not None:
-            ok_code, msg_code = guard.restore_code_backups()
-            if ok_code:
-                restored_any = True
-                self._record_integrity_event("integrity_restore_code")
-            else:
-                # Not fatal; we may still have a vault backup.
-                self._record_integrity_event(f"integrity_restore_code_fail:{msg_code}")
-
-        # Restore the encrypted vault file itself.
-        ok_vault = False
-        try:
-            ok_vault = self.vault.restore_from_backup()
-        except Exception:
-            ok_vault = False
-
-        if ok_vault:
-            restored_any = True
-            self._record_integrity_event("integrity_restore_vault")
-
-        if not restored_any:
-            self._show_error(
-                "No usable backups were found.\n\n"
-                "The application or vault files appear modified and no "
-                "backup snapshots are available to restore from."
-            )
-            return False
-
-        # After restoring from backup, verify integrity once more.
-        if guard is not None:
-            ok2, msg2 = guard.verify(vault_header)
-            if ok2:
-                self._set_integrity_status("ok")
-                self.status_label.setText(
-                    "Restored from backup after integrity alert."
-                )
-
-                # during the restore operation.
-                corrupt_paths = getattr(guard, "last_corrupt_paths", []) or []
-                if corrupt_paths:
-                    resp = QMessageBox.question(
-                        self,
-                        "Remove corrupted copies?",
-                        (
-                            "Older copies of critical files that failed the "
-                            "integrity check were renamed and are no longer "
-                            "used by the application.\n\n"
-                            "You can safely delete these corrupted copies to "
-                            "keep the installation clean.\n\n"
-                            "Do you want to delete all corrupted copies now?"
-                        ),
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.No,
-                    )
-                    if resp == QMessageBox.Yes:
-                        deleted = 0
-                        for p in corrupt_paths:
-                            try:
-                                p.unlink(missing_ok=True)
-                                deleted += 1
-                            except Exception:
-                                # Best-effort: if deletion fails, just skip.
-                                continue
-                        if deleted:
-                            self.status_label.setText(
-                                "Restored from backup and deleted old corrupted copies."
-                            )
-
-                return True
-
-            self._set_integrity_status("alert", msg2)
-            self._show_error(
-                "Even after restoring from backup, the integrity check still "
-                "does not pass.\n\n"
-                f"{msg2}\n\n"
-                "For safety, the vault will remain locked."
-            )
-            return False
-
-        # If there is no guard, but we did restore something, we just report success.
-        return restored_any
+        self._show_error(
+            "Automatic restoration on a local integrity alert is disabled.\n\n"
+            "Reinstall code from a trusted source. Restore an encrypted vault "
+            "only through the explicit, authenticated recovery workflow."
+        )
+        return False
 
     def on_security_details_clicked(self) -> None:
         """
@@ -2408,17 +2329,14 @@ class ManagerTab(QWidget):
                         f"{message}"
                     )
                     alert.setInformativeText(
-                        "The vault has been locked to protect your secrets.\n\n"
-                        "You can attempt to restore the application code and vault "
-                        "file from the last known good backups.\n\n"
-                        "Do you want to restore from backup now?"
+                        "The vault has been locked. This is a local fingerprint "
+                        "warning, not trusted attestation. No code or vault files "
+                        "will be restored automatically. Verify the application "
+                        "from a trusted source before trying again."
                     )
-                    alert.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-                    alert.setDefaultButton(QMessageBox.No)
-                    choice = alert.exec()
+                    alert.setStandardButtons(QMessageBox.Ok)
+                    alert.exec()
 
-                    if choice == QMessageBox.Yes:
-                        self._restore_from_backups(header or {})
 
                     # After a hard integrity alert we stop further processing in this tick
                     return

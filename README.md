@@ -129,12 +129,34 @@ Migration/rollback are not safe while a second process has the vault open.
 Retain independent backups; the adjacent recovery archive is not an offsite
 backup. Do not run this experimental process on irreplaceable credentials.
 
+## M5: Local integrity monitor (advisory only)
+
+The source-file and vault-header hash comparison uses a locally writable
+manifest. It is **not cryptographic attestation** or protection against a
+hostile process with access to the same machine. A missing manifest seeds a
+new, untrusted baseline; a matching baseline is only a local consistency check.
+
+Code and vault files are **never automatically restored** after a mismatch.
+On an unlock-time mismatch the GUI warns the user and requires explicit
+confirmation before attempting normal authenticated decryption. An unexpected
+change should be investigated by reinstalling code from a verified source.
+Live monitoring locks the vault on a newly detected mismatch, but offers no
+automatic restore. Accepting an existing mismatch disables repeated baseline
+polling for that session (the baseline is already known to have drifted) and
+leaves a visible alert. The next unlock requires new consent. Use the separate
+explicit vault recovery/migration workflow
+for encrypted vault recovery. Local code-backup restore is disabled; old code
+backup artifacts are not deleted by this change.
+
+The guard does not establish trust in code, prevent malware or exfiltration,
+validate repository signatures, or independently authenticate the vault.
+
 ## Engineering priorities
 
 - Completed: the password generation path now uses an operating-system CSPRNG; quantum simulation is retained for demonstration metadata.
 - Completed: unbiased character sampling, validated unique-character alphabets, and password length limits (8–128). Continue reviewing the GUI's optional memory-word transformations.
 - Completed: explicit authenticated v1-to-v2 migration and rollback with standalone encrypted recovery archives; keep testing on synthetic vaults.
-- Add automated tests, threat-model documentation, and continuous integration.
+- Add independent threat-model documentation, CI, and integration tests beyond the local integrity monitor.
 - Review local file permissions, backup handling, and atomic vault writes before considering real credential storage.
 
 ## Project status
