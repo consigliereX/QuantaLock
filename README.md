@@ -151,6 +151,21 @@ backup artifacts are not deleted by this change.
 The guard does not establish trust in code, prevent malware or exfiltration,
 validate repository signatures, or independently authenticate the vault.
 
+## GUI generation and clipboard behavior
+
+The GUI's optional memory word is appended to the **complete**
+OS-CSPRNG-generated character sequence instead of replacing random characters.
+The configured length represents the *random component*; a memory word adds
+up to 32 more characters. Password strength shown immediately after generation
+counts only the uniform random component and never credits the user word.
+Long combined passwords may not be accepted by every external service.
+
+Clipboard auto-clear compares the current clipboard with a fingerprint of the
+password the application last copied; unrelated clipboard text is left alone.
+This does **not** remove copies retained by clipboard history, OS integration,
+other applications or screenshots. Do not use sensitive credentials with an
+untrusted desktop/clipboard manager.
+
 ## Engineering priorities
 
 - Completed: the password generation path now uses an operating-system CSPRNG; quantum simulation is retained for demonstration metadata.

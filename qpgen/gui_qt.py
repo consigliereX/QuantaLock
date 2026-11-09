@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 
 from .config import QuantumPassConfig, DEFAULT_CONFIG
 from .cli import generate_password_with_meta
+from .gui_password_safety import (compose_password, clipboard_fingerprint, clipboard_matches)
 from .vault import QuantumVault, VaultEntry, QuantumVaultError, KDF_ITERATIONS
 
 # Integrity watchdog (optional – GUI degrades gracefully if missing)
@@ -284,7 +285,7 @@ class GeneratorTab(QWidget):
         layout.setSpacing(10)
 
         # Password length
-        length_label = QLabel("Password length (characters)")
+        length_label = QLabel("Random password characters (8–128)")
         self.length_spin = QSpinBox()
         self.length_spin.setRange(8, 128)
         self.length_spin.setValue(self.config.password_length)
@@ -336,14 +337,14 @@ class GeneratorTab(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        # Optional memory word: user-chosen phrase blended into the quantum password
+        # Optional memory word: appended AFTER the full CSPRNG component, never substituted
         memory_row = QHBoxLayout()
 
         memory_label = QLabel("Memory word (optional)")
         memory_row.addWidget(memory_label)
 
         self.memory_word_edit = QLineEdit()
-        self.memory_word_edit.setPlaceholderText("e.g. your own word to mix in")
+        self.memory_word_edit.setPlaceholderText("Optional suffix; up to 32 characters")
         memory_row.addWidget(self.memory_word_edit, 1)
 
         # Generate button lives next to the memory word for a minimalist flow
@@ -405,39 +406,14 @@ class GeneratorTab(QWidget):
     # -- actions --
 
     def _mix_with_memory_word(self, password: str) -> str:
+        """Append optional user text; never replace OS-CSPRNG characters.
+
+        The configured password length describes the RANDOM component;
+        any memory word increases final output length and contributes no
+        credited entropy. This is not a memory-safe secret container.
         """
-        Blend the user-provided memory word into the quantum password.
-
-        The memory word is injected as one contiguous block inside the
-        quantum password so the user can visually recognize it, but the
-        base entropy still comes from the quantum generator.
-        """
-        # Safety: if the UI field is missing or empty, just return the
-        # original quantum password.
-        word = self.memory_word_edit.text().strip() if hasattr(self, "memory_word_edit") else ""
-        if not word or not password:
-            return password
-
-        # Use only visible characters, preserve their order exactly.
-        word_chars = "".join(c for c in word if not c.isspace())
-        if not word_chars:
-            return password
-
-        # If the memory word is longer than the password target length,
-        # truncate it to fit rather than shuffling characters.
-        if len(word_chars) >= len(password):
-            return word_chars[: len(password)]
-
-        # Choose a deterministic insertion point based on a hash of
-        # (word + password). This keeps it stable for a given config
-        # but still non-obvious from the outside.
-        digest = hashlib.sha256((word + "|" + password).encode("utf-8")).digest()
-        max_start = len(password) - len(word_chars)
-        insert_at = digest[0] % (max_start + 1)
-
-        base = list(password)
-        base[insert_at : insert_at + len(word_chars)] = list(word_chars)
-        return "".join(base)
+        word = self.memory_word_edit.text() if hasattr(self, "memory_word_edit") else ""
+        return compose_password(password, word)
 
     def on_generate_clicked(self) -> None:
         self.config.password_length = self.length_spin.value()
@@ -446,14 +422,10 @@ class GeneratorTab(QWidget):
 
         try:
             meta = generate_password_with_meta(self.config)
+            final_password = self._mix_with_memory_word(meta.password)
         except Exception as exc:  # noqa: BLE001
             self._show_error(f"Error while generating password:\n{exc}")
             return
-
-        # Base quantum password
-        base_password = meta.password
-        # Blend in optional memory word
-        final_password = self._mix_with_memory_word(base_password)
 
         # IMPORTANT: show the *final* password everywhere
         self.password_field.setPlainText(final_password)
@@ -463,44 +435,41 @@ class GeneratorTab(QWidget):
             f"circuit demonstration: {self.config.num_qubits} qubits."
         )
 
-        # Strength is computed on the final password (with memory word mixed in)
-        bits = estimate_entropy_bits(final_password)
+        # Count only uniform CSPRNG characters; the memory word gets zero credit.
+        bits = len(meta.password) * math.log2(len(self.config.alphabet))
         label = entropy_label(bits)
         if bits <= 0:
             self.strength_label.setText("Password strength: –")
         else:
             self.strength_label.setText(
-                f"Password strength: {label} (~{bits:.1f} bits)"
+                f"Random component: {label} (~{bits:.1f} bits; suffix not counted)"
             )
 
-        # Auto-copy uses whatever is in password_field, so it will
-        # now correctly copy the memory-word-mixed password.
+        # Auto-copy uses the complete output displayed in password_field.
         if self.autocopy_check.isChecked():
             self.copy_to_clipboard(show_message=False)
 
-    def _arm_secure_clipboard(self, owner_tag: str, timeout_ms: int = 15000) -> None:
-        """
-        Start a timer to clear the clipboard after a short interval.
-
-        owner_tag is used so we only clear clipboard content we put there.
-        """
-        self._clipboard_token = owner_tag
+    def _arm_secure_clipboard(self, copied_text: str, timeout_ms: int = 15000) -> None:
+        """Track a fingerprint of OUR copied text; do not retain its plaintext."""
+        self._clipboard_token = clipboard_fingerprint(copied_text)
         self._clipboard_timer.start(timeout_ms)
 
     def _on_clipboard_timeout(self) -> None:
-        """
-        Clear clipboard if it still holds a value we placed.
-        """
-        if not self._clipboard_token:
-            return
+        """Clear only if the clipboard still contains OUR copied password.
 
-        cb = QGuiApplication.clipboard()
-        current_text = cb.text()
-        if current_text:
-            cb.clear()
-
+        Clipboard history, Wayland/X11 managers and other apps may retain
+        copies even after a successful clear; this is best-effort only.
+        """
+        token = self._clipboard_token
         self._clipboard_token = None
-        self.status_label.setText("Clipboard cleared for safety.")
+        if token is None:
+            return
+        cb = QGuiApplication.clipboard()
+        if clipboard_matches(token, cb.text()):
+            cb.clear()
+            self.status_label.setText("Copied password removed from clipboard (best effort).")
+        else:
+            self.status_label.setText("Clipboard changed; newer contents preserved.")
 
     def copy_to_clipboard(self, show_message: bool = True) -> None:
         password = self.password_field.toPlainText()
@@ -519,7 +488,7 @@ class GeneratorTab(QWidget):
             )
             return
 
-        self._arm_secure_clipboard(owner_tag="generator")
+        self._arm_secure_clipboard(copied_text=password)
 
         if show_message:
             self.status_label.setText(
@@ -2806,30 +2775,27 @@ class ManagerTab(QWidget):
         self.entry_strength_label.setText("Entry strength: –")
         self._bump_idle_timer()
 
-    def _arm_secure_clipboard(self, owner_tag: str, timeout_ms: int = 15000) -> None:
-        """
-        Start a timer to clear the clipboard after a short interval.
-
-        owner_tag marks that this instance is responsible for the clipboard.
-        """
-        self._clipboard_token = owner_tag
+    def _arm_secure_clipboard(self, copied_text: str, timeout_ms: int = 15000) -> None:
+        """Track a fingerprint of OUR copied text; do not retain its plaintext."""
+        self._clipboard_token = clipboard_fingerprint(copied_text)
         self._clipboard_timer.start(timeout_ms)
 
     def _on_clipboard_timeout(self) -> None:
-        """
-        Clear clipboard if it still holds a value we placed.
-        """
-        if not self._clipboard_token:
-            return
+        """Clear only if the clipboard still contains OUR copied password.
 
-        cb = QGuiApplication.clipboard()
-        current_text = cb.text()
-        if current_text:
-            cb.clear()
-
+        Clipboard history, Wayland/X11 managers and other apps may retain
+        copies even after a successful clear; this is best-effort only.
+        """
+        token = self._clipboard_token
         self._clipboard_token = None
-        self.status_label.setText("Clipboard cleared for safety.")
-        # Clipboard activity is part of defensive posture, not a tamper event.
+        if token is None:
+            return
+        cb = QGuiApplication.clipboard()
+        if clipboard_matches(token, cb.text()):
+            cb.clear()
+            self.status_label.setText("Copied password removed from clipboard (best effort).")
+        else:
+            self.status_label.setText("Clipboard changed; newer contents preserved.")
 
     def on_copy_clicked(self) -> None:
         if not self.unlocked:
@@ -2858,7 +2824,7 @@ class ManagerTab(QWidget):
             )
             return
 
-        self._arm_secure_clipboard(owner_tag="vault_entry")
+        self._arm_secure_clipboard(copied_text=password)
 
         self.status_label.setText(
             "Password copied to clipboard (auto-clear in a few seconds)."
