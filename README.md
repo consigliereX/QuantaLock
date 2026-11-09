@@ -1,136 +1,58 @@
-# QuantaLock
-### *Quantum-Seeded Password Generator & Secure Vault*
+QuantaLock
+Experimental password-generation and encrypted-vault prototype using simulated quantum circuits.
+[!IMPORTANT]
+Research prototype — not security-audited. QuantaLock does not use a physical quantum random-number generator. Do not rely on it for production secrets or high-value credentials. The password-generation and vault designs require security review and validation.
 
-![build](https://img.shields.io/badge/build-passing-brightgreen)
-![security](https://img.shields.io/badge/security-quantum--grade-purple)
-![python](https://img.shields.io/badge/python-3.11%2B-blue)
-![platform](https://img.shields.io/badge/platform-offline%20only-critical)
-![encryption](https://img.shields.io/badge/encryption-PBKDF2%20%7C%20AES--128-orange)
-![license](https://img.shields.io/badge/license-MIT-lightgrey)
+What this project does
+- Builds and samples quantum circuits using Qiskit Aer's classical simulator.
+- XOR-combines simulated bitstreams and mixes the result with SHA-256.
+- Maps processed bits into a configurable password alphabet.
+- Provides a Python CLI and PySide6 GUI.
+- Stores vault entries encrypted with Fernet, using PBKDF2-HMAC-SHA256 (300,000 iterations) to derive a key from the master password and a device-dependent salt.
+- Includes local backups and an integrity manifest for selected source files.
+Security and correctness limitations
+1. Simulation is not quantum entropy. qiskit_aer.AerSimulator simulates quantum circuit behavior in software. It does not obtain randomness from quantum hardware, and its sampling must not be assumed cryptographically secure.
+2. Some circuit outputs are deterministic. The circuit applies an H gate and then a second H gate to odd-indexed qubits before measurement, yielding predictable zeroes in the ideal circuit. With the default 20-qubit configuration, only 10 positions per stream are nondeterministic in an ideal simulation.
+3. Hashing does not create entropy. SHA-256 can mix bits but cannot increase the amount of unpredictable information in its input. XORing simulator streams does not establish a cryptographically secure entropy source.
+4. Password mapping can bias or repeat outputs. The implementation reduces 8-bit values modulo the alphabet length, and repeats a bitstream when it is too short. The reported entropy_bits is a theoretical alphabet-capacity figure, not a measured security strength.
+5. Device binding is not a guaranteed security boundary. Key derivation uses a local device-secret file and coarse system fingerprint. An attacker who can obtain these may reproduce the binding. Conversely, changes in OS/kernel or hostname data, or loss of the device-secret file, may make an existing vault impossible to unlock.
+6. Vault reliability and security have not been independently established. Preserve backups of the vault and its device-secret file before experiments. The current implementation is not recommended for protecting important credentials.
+7. Local integrity checks are not trusted attestation. A manifest and locally held keys cannot provide strong tamper resistance against an attacker controlling the machine.
+How it works
+Qiskit Aer circuit simulator
+    -> sample bitstreams -> XOR -> SHA-256 mixing
+    -> 8-bit chunks -> alphabet mapping -> candidate password
 
-QuantaLock is a next-generation security tool that uses real quantum randomness, cryptographic entropy amplification, and device-bound encryption to generate and store ultra-secure passwords.
-It combines a quantum simulator, entropy mixing engine, and zero-trust vault into one simple system.
-
-QuantaLock works fully offline and never sends data anywhere.
-
----
-
-# Key Features
-
-## 1. Quantum-Based Password Generation
-QuantaLock prepares qubits in superposition and measures them in alternating bases (Z/X) to produce raw quantum bits.
-
-## 2. Entropy Amplification (SHA-256 Rounds)
-Quantum output is mixed and strengthened using SHA-256 hashing.
-
-## 3. Multi-Stream Quantum XOR Mixing
-Multiple quantum streams can be XOR-combined to increase unpredictability.
-
-## 4. Secure Vault with Device Binding
-Protected by:
-- Master password
-- Quantum-derived salt (q_salt)
-- Device-bound secret & fingerprint
-- PBKDF2-HMAC-SHA256 (300k iterations)
-
-Even if the vault file is copied, it cannot be decrypted on another device.
-
-## 5. Integrity Guard
-- Detects tampering
-- Validates vault header
-- Maintains encrypted code backups
-
-## 6. Full GUI + CLI Support
-- GUI (`run_qpgen_gui.py`)
-- CLI (`run_qpgen.py`)
-
----
-
-# How It Works (Flowstate Overview)
-
-## Password Generation Flowstate
-Quantum Circuit → Raw Bits → Entropy Mixer (SHA-256) → 8-bit Chunking → Alphabet Mapping → Final Password
-
-## Vault Security Flowstate
-Master Password + Quantum Salt + Device Secret + System Fingerprint
-→ PBKDF2 Key Derivation (300k)
-→ Fernet AES-128 Encryption
-→ Secure Encrypted Vault + Automatic Backup
-
-## Quantum Engine Flowstate
-Superposition (H-gates) → Z/X Measurements → Raw Bitstream
-
----
-
-# Project Structure (Core Files)
-
-- `quantum_engine.py` — Quantum circuit builder & bit generator  
-- `entropy.py` — SHA-256 entropy mixer  
-- `mapping.py` — Bit-to-character mapping  
-- `vault.py` — AES-encrypted vault  
-- `guard.py` — Integrity & hardware binding  
-- `cli.py` — Command-line generator  
-- `gui_qt.py` — GUI application  
-- `config.py` — Configurable parameters  
-
----
-
-# Usage
-
-## Command Line
-```
+Master password + stored salt + local secret + system fingerprint
+    -> PBKDF2-HMAC-SHA256 -> Fernet key
+    -> encrypted local vault
+Project layout
+qpgen/
+  quantum_engine.py   Qiskit Aer circuit simulation
+  entropy.py          SHA-256 processing
+  mapping.py          Password alphabet mapping
+  config.py           Generator settings
+  cli.py              CLI and generation pipeline
+  gui_qt.py           GUI
+  vault.py            Vault persistence and cryptography
+  guard.py            Device binding and local integrity checks
+run_qpgen.py          CLI entry point
+run_qpgen_gui.py      GUI entry point
+requirements.txt      Python dependencies
+Local setup
+Python 3.11+ is the intended runtime. The dependency list includes Qiskit, Qiskit Aer, cryptography, and PySide6. Compatibility across platforms has not been independently verified.
+git clone https://github.com/consigliereX/QuantaLock.git
+cd QuantaLock
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 python run_qpgen.py
-```
-
-## GUI
-```
-python run_qpgen_gui.py
-```
-
-Allows:
-- Unlocking the vault
-- Adding/updating entries
-- Rotating passwords
-- Viewing metadata
-
----
-
-# Configuration
-
-Inside `config.py`:
-
-- `num_qubits` — quantum entropy source  
-- `password_length` — final password length  
-- `entropy_rounds` — SHA-256 passes  
-- `quantum_streams` — multi-stream XOR  
-- `alphabet` — allowed characters  
-
----
-
-# Security Model Summary
-
-## 1. High-entropy randomness
-Superposition → unpredictable measurement outcomes.
-
-## 2. Strong cryptographic mixing
-SHA-256 amplification.
-
-## 3. Device locking
-Vault keys are bound to the originating machine.
-
-## 4. Anti-tamper checks
-IntegrityGuard validates critical code and header integrity.
-
-## 5. Encrypted backups
-Vault and code backups are stored securely and locally.
-
----
-
-# Why QuantaLock?
-
-Traditional password generators rely on pseudo-randomness.
-QuantaLock uses **quantum entropy**, **cryptographic reinforcement**, and **hardware binding** to produce passwords far beyond typical systems.
-
-Offline. Zero-tracking. Industrial-grade security with simplicity.
-
-<!-- keywords: quantum security, entropy engine, quantum randomness, password generator, zero trust vault -->
+To launch the GUI: python run_qpgen_gui.py.
+Engineering priorities
+- Replace simulator output in the real password generator with an operating-system cryptographically secure random-number generator (CSPRNG); keep quantum-circuit simulation as a separate educational feature.
+- Use unbiased alphabet sampling, explicit validation, and safe length limits.
+- Redesign vault recovery and device binding to avoid routine OS changes causing lockout.
+- Add automated tests, threat-model documentation, and continuous integration.
+- Review local file permissions, backup handling, and atomic vault writes before considering real credential storage.
+Project status
+Experimental / research-only. No claim of quantum-grade security, security certification, or production readiness is made.
