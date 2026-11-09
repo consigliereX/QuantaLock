@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math 
 from .config import QuantumPassConfig, DEFAULT_CONFIG
+from .quantum_engine import QuantumEngine
 from .entropy import amplify_entropy
-from .secure_password import secure_password, validate_password_config
+from .mapping import bits_to_password
 
 @dataclass
 class QuantumGenerationMeta:
@@ -43,8 +44,6 @@ def generate_password_with_meta(
     - Map to password characters.
     """
     cfg = config or DEFAULT_CONFIG
-    validate_password_config(cfg)
-    from .quantum_engine import QuantumEngine  # optional educational simulation
 
     # --- quantum sampling: multiple streams ---
     streams_raw_bits: list[list[int]] = []
@@ -81,7 +80,7 @@ def generate_password_with_meta(
     amplified_bits = amplify_entropy(combined_bits, cfg.entropy_rounds)
 
     # --- map to password ---
-    password = secure_password(cfg)  # simulation is metadata, not an entropy source
+    password = bits_to_password(amplified_bits, cfg)
 
     # --- theoretical entropy estimate (per password) ---
     if cfg.alphabet:
@@ -103,13 +102,19 @@ def generate_password_with_meta(
 def generate_password(
     config: QuantumPassConfig | None = None,
 ) -> str:
-    """Create a password using the OS CSPRNG, without running the simulator."""
-    return secure_password(config or DEFAULT_CONFIG)
+    """
+    High-level function:
+    - Get raw bits from quantum engine.
+    - Amplify/mix them.
+    - Map to password characters.
+    """
+    meta = generate_password_with_meta(config)
+    return meta.password
 
 def main() -> None:
     """
     Entry point for `python -m qpgen.cli` or `run_qpgen.py`.
     """
     password = generate_password()
-    print("\n[QuantaLock Secure Password Generator]")
+    print("\n[Quantum Superposition Password Generator]")
     print(f"Generated password: {password}\n")

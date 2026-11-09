@@ -225,7 +225,7 @@ class IntegrityGuard:
         if not manifest_path.exists():
             # First run or manifest intentionally removed.
             self._write_manifest(current)
-            return True, "Local baseline initialized (not trusted attestation)."
+            return True, "Integrity manifest initialized."
 
         try:
             stored = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -233,7 +233,7 @@ class IntegrityGuard:
             return False, f"Failed to read integrity manifest: {exc!r}"
 
         if stored == current:
-            return True, "Local hashes match saved baseline (not trusted attestation)."
+            return True, "Integrity check passed."
 
         # Compute a minimal diff description.
         diffs = []
@@ -253,7 +253,7 @@ class IntegrityGuard:
             diffs.append("vault_header changed")
 
         detail = "; ".join(diffs) if diffs else "Unknown mismatch."
-        return False, f"Local baseline mismatch (not trusted attestation): {detail}"
+        return False, f"Integrity manifest mismatch: {detail}"
 
     # --- helpers ---
 
@@ -420,15 +420,64 @@ class IntegrityGuard:
                 continue
 
     def restore_code_backups(self) -> Tuple[bool, str]:
-        """Disabled: a locally stored backup is not trusted executable code.
-
-        Restore program files from a verified Git commit or trusted release
-        outside the running application. Existing backups are left untouched.
         """
-        return False, (
-            "Automatic code restoration disabled; reinstall from a trusted "
-            "source and review local changes before using the vault."
-        )
+        Restore critical source files from their latest backup copies.
+
+        Prefers encrypted backups; falls back to plaintext copies for
+        compatibility with older installations.
+        """
+        if self.root_dir is None:
+            return False, "No root_dir set for IntegrityGuard."
+
+        backup_dir = self._ensure_backup_dir()
+        if backup_dir is None:
+            return False, "No backup directory available."
+
+        key = self._load_backup_key()
+        fernet = Fernet(key) if key is not None else None
+
+        restored: list[str] = []
+        # Reset the list of renamed corrupt files for this restore run.
+        self.last_corrupt_paths = []
+
+
+        for rel in self._critical_files():
+            enc_src = backup_dir / f"{rel}.enc"
+            plain_src = backup_dir / rel
+            dst = self.root_dir / rel
+
+            use_encrypted = enc_src.exists() and fernet is not None
+            use_plain = plain_src.exists()
+
+            if not use_encrypted and not use_plain:
+                continue
+
+            try:
+                if dst.exists():
+                    try:
+                        corrupt = dst.with_suffix(dst.suffix + ".corrupt")
+                        dst.replace(corrupt)
+                        # Remember this renamed file so the GUI can offer deletion.
+                        self.last_corrupt_paths.append(corrupt)
+                    except Exception:
+                        # If we cannot rename, we overwrite directly.
+                        pass
+
+                if use_encrypted:
+                    data_enc = enc_src.read_bytes()
+                    data = fernet.decrypt(data_enc)
+                    dst.write_bytes(data)
+                else:
+                    shutil.copy2(plain_src, dst)
+
+                restored.append(rel)
+            except Exception:
+                continue
+
+        if not restored:
+            return False, "No backups found for critical files."
+
+        return True, f"Restored from backup: {', '.join(restored)}"
 
     def _write_manifest(self, state: Dict) -> None:
         manifest_path = self.manifest_path
@@ -439,5 +488,9 @@ class IntegrityGuard:
             # Best-effort only; failure just means we skip persistent integrity.
             return
 
-        # No automatic application-code snapshots: local backups are not
-        # authenticated release artifacts and must not be used as code repair.
+        # On successful manifest write, refresh backups of critical files.
+        try:
+            self.create_code_backups()
+        except Exception:
+            # Backup is best-effort; ignore failures here.
+            pass

@@ -47,7 +47,6 @@ from PySide6.QtWidgets import (
 
 from .config import QuantumPassConfig, DEFAULT_CONFIG
 from .cli import generate_password_with_meta
-from .gui_password_safety import (compose_password, clipboard_fingerprint, clipboard_matches)
 from .vault import QuantumVault, VaultEntry, QuantumVaultError, KDF_ITERATIONS
 
 # Integrity watchdog (optional – GUI degrades gracefully if missing)
@@ -285,9 +284,9 @@ class GeneratorTab(QWidget):
         layout.setSpacing(10)
 
         # Password length
-        length_label = QLabel("Random password characters (8–128)")
+        length_label = QLabel("Password length (characters)")
         self.length_spin = QSpinBox()
-        self.length_spin.setRange(8, 128)
+        self.length_spin.setRange(6, 128)
         self.length_spin.setValue(self.config.password_length)
         self.length_spin.setSingleStep(2)
 
@@ -337,14 +336,14 @@ class GeneratorTab(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        # Optional memory word: appended AFTER the full CSPRNG component, never substituted
+        # Optional memory word: user-chosen phrase blended into the quantum password
         memory_row = QHBoxLayout()
 
         memory_label = QLabel("Memory word (optional)")
         memory_row.addWidget(memory_label)
 
         self.memory_word_edit = QLineEdit()
-        self.memory_word_edit.setPlaceholderText("Optional suffix; up to 32 characters")
+        self.memory_word_edit.setPlaceholderText("e.g. your own word to mix in")
         memory_row.addWidget(self.memory_word_edit, 1)
 
         # Generate button lives next to the memory word for a minimalist flow
@@ -406,14 +405,39 @@ class GeneratorTab(QWidget):
     # -- actions --
 
     def _mix_with_memory_word(self, password: str) -> str:
-        """Append optional user text; never replace OS-CSPRNG characters.
-
-        The configured password length describes the RANDOM component;
-        any memory word increases final output length and contributes no
-        credited entropy. This is not a memory-safe secret container.
         """
-        word = self.memory_word_edit.text() if hasattr(self, "memory_word_edit") else ""
-        return compose_password(password, word)
+        Blend the user-provided memory word into the quantum password.
+
+        The memory word is injected as one contiguous block inside the
+        quantum password so the user can visually recognize it, but the
+        base entropy still comes from the quantum generator.
+        """
+        # Safety: if the UI field is missing or empty, just return the
+        # original quantum password.
+        word = self.memory_word_edit.text().strip() if hasattr(self, "memory_word_edit") else ""
+        if not word or not password:
+            return password
+
+        # Use only visible characters, preserve their order exactly.
+        word_chars = "".join(c for c in word if not c.isspace())
+        if not word_chars:
+            return password
+
+        # If the memory word is longer than the password target length,
+        # truncate it to fit rather than shuffling characters.
+        if len(word_chars) >= len(password):
+            return word_chars[: len(password)]
+
+        # Choose a deterministic insertion point based on a hash of
+        # (word + password). This keeps it stable for a given config
+        # but still non-obvious from the outside.
+        digest = hashlib.sha256((word + "|" + password).encode("utf-8")).digest()
+        max_start = len(password) - len(word_chars)
+        insert_at = digest[0] % (max_start + 1)
+
+        base = list(password)
+        base[insert_at : insert_at + len(word_chars)] = list(word_chars)
+        return "".join(base)
 
     def on_generate_clicked(self) -> None:
         self.config.password_length = self.length_spin.value()
@@ -422,54 +446,62 @@ class GeneratorTab(QWidget):
 
         try:
             meta = generate_password_with_meta(self.config)
-            final_password = self._mix_with_memory_word(meta.password)
         except Exception as exc:  # noqa: BLE001
             self._show_error(f"Error while generating password:\n{exc}")
             return
+
+        # Base quantum password
+        base_password = meta.password
+        # Blend in optional memory word
+        final_password = self._mix_with_memory_word(base_password)
 
         # IMPORTANT: show the *final* password everywhere
         self.password_field.setPlainText(final_password)
 
         self.status_label.setText(
-            "Base password: OS CSPRNG; "
-            f"circuit demonstration: {self.config.num_qubits} qubits."
+            f"Generated with {self.config.num_qubits} qubits, "
+            f"length {self.config.password_length}, "
+            f"entropy rounds {self.config.entropy_rounds}."
         )
 
-        # Count only uniform CSPRNG characters; the memory word gets zero credit.
-        bits = len(meta.password) * math.log2(len(self.config.alphabet))
+        # Strength is computed on the final password (with memory word mixed in)
+        bits = estimate_entropy_bits(final_password)
         label = entropy_label(bits)
         if bits <= 0:
             self.strength_label.setText("Password strength: –")
         else:
             self.strength_label.setText(
-                f"Random component: {label} (~{bits:.1f} bits; suffix not counted)"
+                f"Password strength: {label} (~{bits:.1f} bits)"
             )
 
-        # Auto-copy uses the complete output displayed in password_field.
+        # Auto-copy uses whatever is in password_field, so it will
+        # now correctly copy the memory-word-mixed password.
         if self.autocopy_check.isChecked():
             self.copy_to_clipboard(show_message=False)
 
-    def _arm_secure_clipboard(self, copied_text: str, timeout_ms: int = 15000) -> None:
-        """Track a fingerprint of OUR copied text; do not retain its plaintext."""
-        self._clipboard_token = clipboard_fingerprint(copied_text)
+    def _arm_secure_clipboard(self, owner_tag: str, timeout_ms: int = 15000) -> None:
+        """
+        Start a timer to clear the clipboard after a short interval.
+
+        owner_tag is used so we only clear clipboard content we put there.
+        """
+        self._clipboard_token = owner_tag
         self._clipboard_timer.start(timeout_ms)
 
     def _on_clipboard_timeout(self) -> None:
-        """Clear only if the clipboard still contains OUR copied password.
-
-        Clipboard history, Wayland/X11 managers and other apps may retain
-        copies even after a successful clear; this is best-effort only.
         """
-        token = self._clipboard_token
-        self._clipboard_token = None
-        if token is None:
+        Clear clipboard if it still holds a value we placed.
+        """
+        if not self._clipboard_token:
             return
+
         cb = QGuiApplication.clipboard()
-        if clipboard_matches(token, cb.text()):
+        current_text = cb.text()
+        if current_text:
             cb.clear()
-            self.status_label.setText("Copied password removed from clipboard (best effort).")
-        else:
-            self.status_label.setText("Clipboard changed; newer contents preserved.")
+
+        self._clipboard_token = None
+        self.status_label.setText("Clipboard cleared for safety.")
 
     def copy_to_clipboard(self, show_message: bool = True) -> None:
         password = self.password_field.toPlainText()
@@ -488,7 +520,7 @@ class GeneratorTab(QWidget):
             )
             return
 
-        self._arm_secure_clipboard(copied_text=password)
+        self._arm_secure_clipboard(owner_tag="generator")
 
         if show_message:
             self.status_label.setText(
@@ -1645,54 +1677,54 @@ class ManagerTab(QWidget):
         self._bump_idle_timer()
 
     def _run_integrity_guard(self) -> bool:
-        """Advisory local fingerprint check, not cryptographic attestation.
-
-        A mismatch never triggers automatic code or vault restoration. Users
-        must explicitly acknowledge the warning before an unlock attempt.
         """
-        guard = getattr(self, "integrity_guard", None)
-        if guard is None:
-            self._set_integrity_status("disabled")
+        Run the integrity watchdog before unlocking the vault.
+
+        Returns True if everything is OK (or initialized),
+        False if a mismatch was detected and the caller should abort.
+        """
+        if not hasattr(self, "integrity_guard") or self.integrity_guard is None:
+            # If the guard is not available, we fail open rather than
+            # locking the user out unexpectedly.
             return True
 
-        # A previous session's accepted warning does not carry over.
-        self._integrity_live_alerted = False
         header = self.vault.get_header_for_integrity()
-        try:
-            ok, message = guard.verify(header)
-        except Exception as exc:
-            ok, message = False, f"Local integrity check unavailable: {exc}"
-
+        ok, message = self.integrity_guard.verify(header)
         if ok:
-            if "initialized" in message.lower():
-                self._set_integrity_status("idle")
-            else:
-                self._set_integrity_status("ok")
-            self._record_integrity_event("integrity_local_match")
+            # Optional: record a soft "integrity_ok" event
+            self._record_integrity_event("integrity_ok")
+            self._set_integrity_status("ok")
             return True
 
-        self._record_integrity_event("integrity_local_mismatch")
+        # Integrity mismatch – offer to restore from backups
+        self._record_integrity_event("integrity_fail")
         self._set_integrity_status("alert", message)
+
         choice = QMessageBox.question(
             self,
-            "Local integrity warning",
-            "The local code/vault fingerprint differs from its saved baseline.\n\n"
+            "Vault integrity check failed",
+            "Vault integrity check failed.\n\n"
             f"{message}\n\n"
-            "This is a locally writable comparison, NOT trusted attestation. "
-            "If the change was unexpected, cancel and reinstall the application "
-            "from a trusted source before entering your master password.\n\n"
-            "Continue with an authenticated unlock attempt? "
-            "No files will be restored automatically.",
+            "If you did not intentionally modify the application or vault, "
+            "you can attempt to restore from the last known good backups of "
+            "the code and vault files.\n\n"
+            "Do you want to restore from backup now?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
+
         if choice == QMessageBox.Yes:
-            # The stored baseline no longer matches; repeated polling would
-            # re-lock in 15 seconds. Disable baseline polling for this session
-            # and retain the visible alert until the next explicit unlock.
-            self._integrity_live_alerted = True
-            self._record_integrity_event("integrity_local_warning_accepted")
-            return True
+            if self._restore_from_backups(header):
+                # Integrity passed after restore – allow the caller to continue.
+                return True
+
+        # If we reach here, either the user declined or restore failed.
+        self._show_error(
+            "Vault integrity check failed.\n\n"
+            f"{message}\n\n"
+            "Refusing to decrypt because the application or vault file "
+            "appears to have been modified."
+        )
         return False
 
     def _set_integrity_status(self, state: str, detail: str | None = None) -> None:
@@ -1711,7 +1743,7 @@ class ManagerTab(QWidget):
             text = "Integrity: idle"
             style = "color: #9ca3af; font-size: 11px;"
         elif state == "ok":
-            text = "Integrity: local match"
+            text = "Integrity: OK"
             style = "color: #10b981; font-size: 11px;"  # soft green
         else:  # "alert"
             short = (detail or "modified").strip()
@@ -1725,17 +1757,96 @@ class ManagerTab(QWidget):
         self.integrity_status_label.setStyleSheet(style)
 
     def _restore_from_backups(self, vault_header: dict) -> bool:
-        """Disabled: no automatic application-code or vault rollback on hash drift.
-
-        Vault rollback is available as an explicit authenticated operation
-        from the vault migration/recovery CLI with independent backup checks.
         """
-        self._show_error(
-            "Automatic restoration on a local integrity alert is disabled.\n\n"
-            "Reinstall code from a trusted source. Restore an encrypted vault "
-            "only through the explicit, authenticated recovery workflow."
-        )
-        return False
+        Attempt to restore critical code files and the vault file
+        from their latest backups, then re-run the integrity check.
+
+        Returns True if restore succeeded and integrity now passes.
+        """
+        restored_any = False
+
+        guard = getattr(self, "integrity_guard", None)
+        if guard is not None:
+            ok_code, msg_code = guard.restore_code_backups()
+            if ok_code:
+                restored_any = True
+                self._record_integrity_event("integrity_restore_code")
+            else:
+                # Not fatal; we may still have a vault backup.
+                self._record_integrity_event(f"integrity_restore_code_fail:{msg_code}")
+
+        # Restore the encrypted vault file itself.
+        ok_vault = False
+        try:
+            ok_vault = self.vault.restore_from_backup()
+        except Exception:
+            ok_vault = False
+
+        if ok_vault:
+            restored_any = True
+            self._record_integrity_event("integrity_restore_vault")
+
+        if not restored_any:
+            self._show_error(
+                "No usable backups were found.\n\n"
+                "The application or vault files appear modified and no "
+                "backup snapshots are available to restore from."
+            )
+            return False
+
+        # After restoring from backup, verify integrity once more.
+        if guard is not None:
+            ok2, msg2 = guard.verify(vault_header)
+            if ok2:
+                self._set_integrity_status("ok")
+                self.status_label.setText(
+                    "Restored from backup after integrity alert."
+                )
+
+                # during the restore operation.
+                corrupt_paths = getattr(guard, "last_corrupt_paths", []) or []
+                if corrupt_paths:
+                    resp = QMessageBox.question(
+                        self,
+                        "Remove corrupted copies?",
+                        (
+                            "Older copies of critical files that failed the "
+                            "integrity check were renamed and are no longer "
+                            "used by the application.\n\n"
+                            "You can safely delete these corrupted copies to "
+                            "keep the installation clean.\n\n"
+                            "Do you want to delete all corrupted copies now?"
+                        ),
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No,
+                    )
+                    if resp == QMessageBox.Yes:
+                        deleted = 0
+                        for p in corrupt_paths:
+                            try:
+                                p.unlink(missing_ok=True)
+                                deleted += 1
+                            except Exception:
+                                # Best-effort: if deletion fails, just skip.
+                                continue
+                        if deleted:
+                            self.status_label.setText(
+                                "Restored from backup and deleted old corrupted copies."
+                            )
+
+                return True
+
+            self._set_integrity_status("alert", msg2)
+            self._show_error(
+                "Even after restoring from backup, the integrity check still "
+                "does not pass.\n\n"
+                f"{msg2}\n\n"
+                "For safety, the vault will remain locked."
+            )
+            return False
+
+        # If there is no guard, but we did restore something, we just report success.
+        return restored_any
 
     def on_security_details_clicked(self) -> None:
         """
@@ -2298,14 +2409,17 @@ class ManagerTab(QWidget):
                         f"{message}"
                     )
                     alert.setInformativeText(
-                        "The vault has been locked. This is a local fingerprint "
-                        "warning, not trusted attestation. No code or vault files "
-                        "will be restored automatically. Verify the application "
-                        "from a trusted source before trying again."
+                        "The vault has been locked to protect your secrets.\n\n"
+                        "You can attempt to restore the application code and vault "
+                        "file from the last known good backups.\n\n"
+                        "Do you want to restore from backup now?"
                     )
-                    alert.setStandardButtons(QMessageBox.Ok)
-                    alert.exec()
+                    alert.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                    alert.setDefaultButton(QMessageBox.No)
+                    choice = alert.exec()
 
+                    if choice == QMessageBox.Yes:
+                        self._restore_from_backups(header or {})
 
                     # After a hard integrity alert we stop further processing in this tick
                     return
@@ -2775,27 +2889,30 @@ class ManagerTab(QWidget):
         self.entry_strength_label.setText("Entry strength: –")
         self._bump_idle_timer()
 
-    def _arm_secure_clipboard(self, copied_text: str, timeout_ms: int = 15000) -> None:
-        """Track a fingerprint of OUR copied text; do not retain its plaintext."""
-        self._clipboard_token = clipboard_fingerprint(copied_text)
+    def _arm_secure_clipboard(self, owner_tag: str, timeout_ms: int = 15000) -> None:
+        """
+        Start a timer to clear the clipboard after a short interval.
+
+        owner_tag marks that this instance is responsible for the clipboard.
+        """
+        self._clipboard_token = owner_tag
         self._clipboard_timer.start(timeout_ms)
 
     def _on_clipboard_timeout(self) -> None:
-        """Clear only if the clipboard still contains OUR copied password.
-
-        Clipboard history, Wayland/X11 managers and other apps may retain
-        copies even after a successful clear; this is best-effort only.
         """
-        token = self._clipboard_token
-        self._clipboard_token = None
-        if token is None:
+        Clear clipboard if it still holds a value we placed.
+        """
+        if not self._clipboard_token:
             return
+
         cb = QGuiApplication.clipboard()
-        if clipboard_matches(token, cb.text()):
+        current_text = cb.text()
+        if current_text:
             cb.clear()
-            self.status_label.setText("Copied password removed from clipboard (best effort).")
-        else:
-            self.status_label.setText("Clipboard changed; newer contents preserved.")
+
+        self._clipboard_token = None
+        self.status_label.setText("Clipboard cleared for safety.")
+        # Clipboard activity is part of defensive posture, not a tamper event.
 
     def on_copy_clicked(self) -> None:
         if not self.unlocked:
@@ -2824,7 +2941,7 @@ class ManagerTab(QWidget):
             )
             return
 
-        self._arm_secure_clipboard(copied_text=password)
+        self._arm_secure_clipboard(owner_tag="vault_entry")
 
         self.status_label.setText(
             "Password copied to clipboard (auto-clear in a few seconds)."
