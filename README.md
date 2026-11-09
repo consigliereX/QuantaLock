@@ -82,20 +82,58 @@ To launch the GUI: `python run_qpgen_gui.py`.
   300,000-iteration, device-bound KDF. Saving or changing the master password
   on a v1 file **keeps it v1**. The original device-secret file and system
   fingerprint are still required. No automatic migration is attempted.
-- **Migration:** An explicit, authenticated and independently backed-up v1-to-v2
-  migration is planned but **not** performed by this patch. Preserve copies of
-  the v1 vault and `~/.qpgen_device_secret.bin` before any OS change.
+- **Migration:** Explicit authenticated v1-to-v2 migration is available through
+  `python -m qpgen.migrate_vault migrate`. It creates a uniquely named,
+  encrypted `pre-v2` recovery archive before replacing the live vault, and
+  verifies the new v2 file by reopening it. No automatic migration occurs.
+  Preserve the original v1 device secret and environment for rollback.
 
 Both formats retain M2 atomic writes, a previous-generation encrypted `.bak`
 file, and explicit `restore_from_backup()`. Structural backup checks cannot
 prove decryptability. Restoration of v1 needs the historical binding context.
 Do not use this prototype for important credentials.
 
+## Explicit v1-to-v2 migration (optional)
+
+**Close the GUI before proceeding.** Migrations are manual and only needed
+for older v1 vaults; new v2 vaults do not require them. First inspect the
+version without entering a password:
+
+```bash
+python -m qpgen.migrate_vault inspect
+```
+
+If your vault is **v1**, make separate secure backups of the encrypted vault
+and `~/.qpgen_device_secret.bin` while its original OS fingerprint is still
+available. Then run:
+
+```bash
+python -m qpgen.migrate_vault migrate
+```
+
+The command requests explicit confirmation and the **existing** master
+password via a hidden prompt. It preserves the old v1 ciphertext in a unique
+`.pre-v2-*.bak` file beside the vault and verifies the new portable v2 file.
+It never prints vault entries, master passwords, or ciphertext.
+
+Manual rollback, only if needed (with the **old** v1 master password and
+original device-binding context):
+
+```bash
+python -m qpgen.migrate_vault rollback --archive /path/to/quantum_vault.bin.pre-v2-....bak
+```
+
+Rollback authenticates the archive before modifying the live vault and
+preserves the current v2 ciphertext in a separate `.pre-rollback-v2-*.bak`.
+Migration/rollback are not safe while a second process has the vault open.
+Retain independent backups; the adjacent recovery archive is not an offsite
+backup. Do not run this experimental process on irreplaceable credentials.
+
 ## Engineering priorities
 
 - Completed: the password generation path now uses an operating-system CSPRNG; quantum simulation is retained for demonstration metadata.
 - Completed: unbiased character sampling, validated unique-character alphabets, and password length limits (8–128). Continue reviewing the GUI's optional memory-word transformations.
-- Complete explicit authenticated migration from legacy device-bound v1 to portable v2, including full rollback and recovery validation.
+- Completed: explicit authenticated v1-to-v2 migration and rollback with standalone encrypted recovery archives; keep testing on synthetic vaults.
 - Add automated tests, threat-model documentation, and continuous integration.
 - Review local file permissions, backup handling, and atomic vault writes before considering real credential storage.
 

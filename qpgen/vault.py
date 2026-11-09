@@ -366,6 +366,160 @@ class QuantumVault:
         except OSError as exc:
             raise QuantumVaultError("Vault save failed; previous vault preserved.") from exc
         
+    # ---------- explicit legacy migration ----------
+
+    def migrate_v1_to_v2(self, master_password: str) -> Path:
+        """Explicitly migrate an authenticated v1 vault; return immutable v1 archive.
+
+        Never triggered during ordinary unlock/save/change-master. The original
+        v1 ciphertext is copied to a private, uniquely named recovery archive
+        before any publication. The new v2 vault is verified by a fresh unlock;
+        failures after publication attempt to restore the original ciphertext.
+        Keep the v1 archive AND its historical device secret for rollback.
+        """
+        import secrets
+
+        self.lock()
+        try:
+            original = self.path.read_bytes()
+            payload = json.loads(original)
+        except (OSError, ValueError, TypeError) as exc:
+            raise QuantumVaultError("Cannot read source vault for migration.") from exc
+        if not isinstance(payload, dict) or payload.get("version") != LEGACY_VAULT_VERSION:
+            raise QuantumVaultError("Migration requires an existing v1 vault; nothing changed.")
+
+        # Authenticated unlock with the original v1 key derivation. No disk edits.
+        self.unlock(master_password)
+        if self._vault_version != LEGACY_VAULT_VERSION:
+            self.lock()
+            raise QuantumVaultError("Source vault version changed; nothing changed.")
+        original_entries = [asdict(entry) for entry in self._entries]
+
+        # Build and locally authenticate the v2 candidate before touching disk.
+        salt = self._generate_q_salt()
+        portable_key = self._derive_portable_key(master_password, salt)
+        cipher = Fernet(portable_key).encrypt(json.dumps(original_entries).encode("utf-8"))
+        candidate = json.dumps({
+            "version": VAULT_VERSION,
+            "q_salt": base64.b64encode(salt).decode("ascii"),
+            "data": base64.b64encode(cipher).decode("ascii"),
+        }).encode("utf-8")
+        if json.loads(Fernet(portable_key).decrypt(cipher)) != original_entries:
+            self.lock()
+            raise QuantumVaultError("Candidate validation failed; nothing changed.")
+
+        # Keep a standalone archive, independent of rotating .bak snapshots.
+        archive = self.path.with_name(
+            self.path.name + ".pre-v2-" + secrets.token_hex(12) + ".bak"
+        )
+        try:
+            if archive.exists():
+                raise QuantumVaultError("Recovery archive collision; nothing changed.")
+            _atomic_write_bytes(archive, original)
+            if archive.read_bytes() != original:
+                raise QuantumVaultError("Recovery archive mismatch; nothing changed.")
+            if self.path.read_bytes() != original:
+                raise QuantumVaultError("Source vault changed concurrently; migration aborted.")
+            # Also seed the standard previous-generation backup before publishing.
+            self.backup_to_disk()
+        except (OSError, QuantumVaultError) as exc:
+            self.lock()
+            raise QuantumVaultError("Could not secure original v1 vault; no migration performed.") from exc
+
+        try:
+            _atomic_write_bytes(self.path, candidate)
+            # Fresh instance must verify the actual disk content with the v2 KDF.
+            check = QuantumVault(self.path)
+            check.unlock(master_password)
+            if check._vault_version != VAULT_VERSION or [
+                asdict(entry) for entry in check.entries
+            ] != original_entries:
+                raise QuantumVaultError("Published v2 verification failed.")
+        except Exception as exc:
+            # Restore the exact original encrypted v1 bytes. The archive remains.
+            try:
+                if self.path.read_bytes() != original:
+                    _atomic_write_bytes(self.path, original)
+            except OSError as rollback_exc:
+                self.lock()
+                raise QuantumVaultError(
+                    f"Migration failed and automatic rollback failed; recover using {archive}"
+                ) from rollback_exc
+            self.lock()
+            raise QuantumVaultError("Migration failed; original v1 vault preserved.") from exc
+
+        self._entries = check._entries
+        self._q_salt = check._q_salt
+        self._fernet = check._fernet
+        self._vault_version = VAULT_VERSION
+        return archive
+
+    def restore_v1_migration_backup(self, archive: Path, master_password: str) -> Path:
+        """Explicit rollback, authenticating a same-directory pre-v2 archive.
+
+        A private snapshot of the current v2 ciphertext is kept before replacing
+        it with the v1 archive. This requires the original v1 password and the
+        historical device binding; it never downgrades automatically.
+        """
+        import secrets
+
+        archive = Path(archive)
+        stem = self.path.name + ".pre-v2-"
+        try:
+            same_dir = archive.resolve().parent == self.path.parent.resolve()
+            valid_name = archive.name.startswith(stem) and archive.name.endswith(".bak")
+            if not same_dir or not valid_name or not archive.is_file():
+                raise QuantumVaultError("Invalid v1 recovery archive location.")
+            original = archive.read_bytes()
+            payload = json.loads(original)
+            current = self.path.read_bytes()
+            current_payload = json.loads(current)
+            if not isinstance(payload, dict) or payload.get("version") != LEGACY_VAULT_VERSION:
+                raise QuantumVaultError("Recovery archive is not a v1 vault.")
+            if not isinstance(current_payload, dict) or current_payload.get("version") != VAULT_VERSION:
+                raise QuantumVaultError("Rollback requires a current v2 vault.")
+            salt = base64.b64decode(payload["q_salt"], validate=True)
+            cipher = base64.b64decode(payload["data"], validate=True)
+            # Authenticate before replacing the current vault, using unchanged v1 KDF.
+            decoded = Fernet(self._derive_key(master_password, salt)).decrypt(cipher)
+            entries = json.loads(decoded)
+            if not isinstance(entries, list):
+                raise QuantumVaultError("Recovery archive contains invalid entries.")
+            [VaultEntry(**item) for item in entries]
+        except (OSError, ValueError, TypeError, KeyError, InvalidToken) as exc:
+            self.lock()
+            raise QuantumVaultError("Legacy archive authentication failed; vault unchanged.") from exc
+
+        snapshot = self.path.with_name(
+            self.path.name + ".pre-rollback-v2-" + secrets.token_hex(12) + ".bak"
+        )
+        try:
+            _atomic_write_bytes(snapshot, current)
+            if snapshot.read_bytes() != current or self.path.read_bytes() != current:
+                raise QuantumVaultError("Current v2 snapshot validation failed; no rollback.")
+        except OSError as exc:
+            raise QuantumVaultError("Could not preserve v2 before rollback.") from exc
+
+        try:
+            _atomic_write_bytes(self.path, original)
+            self.lock()
+            self.unlock(master_password)
+            if self._vault_version != LEGACY_VAULT_VERSION or [
+                asdict(entry) for entry in self.entries
+            ] != entries:
+                raise QuantumVaultError("Restored v1 verification failed.")
+        except Exception as exc:
+            try:
+                _atomic_write_bytes(self.path, current)
+            except OSError as rollback_exc:
+                self.lock()
+                raise QuantumVaultError(
+                    f"Restore verification failed and v2 rollback failed; use {snapshot}"
+                ) from rollback_exc
+            self.lock()
+            raise QuantumVaultError("Restore failed; original v2 vault preserved.") from exc
+        return snapshot
+
     def get_header_for_integrity(self) -> dict:
         """
         Return a lightweight, non-sensitive header describing the vault file.
