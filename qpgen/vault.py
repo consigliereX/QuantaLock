@@ -1,9 +1,8 @@
 """
-Quantum-seeded password vault.
+Legacy v1 encrypted password vault.
 
-Passwords are encrypted locally with a key derived from:
-- A user-provided master password
-- Quantum randomness from the QuantumEngine (stored as q_salt)
+New vault salts use OS CSPRNG. Existing stored salts remain unchanged.
+The encrypted key also depends on legacy device binding (see guard.py).
 
 Vault file format (JSON text):
 {
@@ -24,12 +23,42 @@ import base64
 import hashlib
 import os
 import shutil
+import tempfile
 
 from cryptography.fernet import Fernet, InvalidToken  # pip install cryptography
 
-from .config import DEFAULT_CONFIG
-from .quantum_engine import QuantumEngine
-from .entropy import amplify_entropy, bits_to_bytes
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Replace one file atomically using a same-directory, private temp file.
+
+    A crash during the write leaves the existing destination intact. File data
+    is synced before replace; directory syncing is attempted where supported.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.chmod(tmp, 0o600)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        if os.name == "posix":
+            try:
+                dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            except OSError:
+                pass
+            else:
+                try:
+                    os.fsync(dirfd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(dirfd)
+    finally:
+        tmp.unlink(missing_ok=True)
+
 
 def _default_vault_path() -> Path:
     """
@@ -77,8 +106,8 @@ class QuantumVault:
     """
     Encrypted password vault.
 
-    Encryption key = SHA-256(master_password || q_salt),
-    encoded as urlsafe base64 for Fernet.
+    Encryption key is PBKDF2-HMAC-SHA256(master password, bound salt),
+    encoded as urlsafe base64 for Fernet. Legacy v1 device binding retained.
     """
 
     def __init__(self, path: Path | None = None) -> None:
@@ -107,46 +136,48 @@ class QuantumVault:
         return backup_dir / (self.path.name + ".bak")
 
     def backup_to_disk(self) -> None:
-        """
-        Copy the current encrypted vault file to the backup location.
+        """Atomically snapshot the CURRENT encrypted vault to .bak.
 
-        This never touches decrypted entries – it only copies the
-        already-encrypted vault file. The backup is always kept at
-        the latest state by overwriting the previous .bak file.
+        Called *before* overwriting an existing vault. Backup failure aborts
+        the save, preserving the existing recoverable vault.
         """
         if not self.exists():
             return
-
         bpath = self._backup_path()
-        try:
-            shutil.copy2(self.path, bpath)
-        except Exception:
-            # Best-effort only; failure here must not break normal saving.
-            pass
+        _atomic_write_bytes(bpath, self.path.read_bytes())
 
     def restore_from_backup(self) -> bool:
-        """
-        Restore the vault file from its latest backup.
+        """Explicitly restore the preceding vault generation.
 
-        Returns True if a backup existed and was successfully restored.
+        The backup is structurally validated, but cannot be authenticated
+        without its master password/device secret. Preserve the current file
+        as a private .corrupt snapshot before replacing it; never destroy an
+        earlier .corrupt snapshot.
         """
         bpath = self._backup_path()
-        if not bpath.exists():
-            return False
-
         try:
-            # Try to preserve the corrupted file as *.corrupt for forensics.
-            if self.path.exists():
-                try:
-                    corrupt = self.path.with_suffix(self.path.suffix + ".corrupt")
-                    self.path.replace(corrupt)
-                except Exception:
-                    # If we cannot rename, we will overwrite directly.
-                    pass
+            if not bpath.is_file():
+                return False
+            data = bpath.read_bytes()
+            payload = json.loads(data)
+            if not isinstance(payload, dict) or payload.get("version") != VAULT_VERSION:
+                return False
+            if len(base64.b64decode(payload["q_salt"], validate=True)) != 32:
+                return False
+            if not base64.b64decode(payload["data"], validate=True):
+                return False
 
-            shutil.copy2(bpath, self.path)
+            if self.path.exists():
+                # Use a unique suffix so forensic copies are never overwritten.
+                import secrets
+                corrupt = self.path.with_name(
+                    self.path.name + ".corrupt." + secrets.token_hex(6)
+                )
+                _atomic_write_bytes(corrupt, self.path.read_bytes())
+            _atomic_write_bytes(self.path, data)
+            self.lock()  # Require a fresh authenticated unlock after restore.
             return True
-        except Exception:
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return False
 
     # ---------- helpers ----------
@@ -156,28 +187,11 @@ class QuantumVault:
         return self.path.exists()
 
     def _generate_q_salt(self) -> bytes:
+        """Create a fresh 32-byte salt with the operating-system CSPRNG.
+
+        Existing v1 vaults retain their previously stored salt unchanged.
         """
-        Generate a 32-byte quantum-derived salt.
-
-        We use the QuantumEngine to get raw bits, amplify them,
-        then pack into bytes and trim/expand to 32 bytes.
-        """
-        engine = QuantumEngine(DEFAULT_CONFIG)
-        bits, _, _ = engine.get_raw_bits_with_meta()
-        q_bits = amplify_entropy(bits, rounds=2)
-        q_bytes = bits_to_bytes(q_bits)
-
-        if not q_bytes:
-            # Extremely unlikely, but fall back to deterministic zeros
-            q_bytes = b"\x00" * 32
-
-        if len(q_bytes) < 32:
-            # Repeat to reach 32 bytes
-            repeat = (32 + len(q_bytes) - 1) // len(q_bytes)
-            q_bytes = (q_bytes * repeat)[:32]
-        else:
-            q_bytes = q_bytes[:32]
-        return q_bytes
+        return os.urandom(32)
 
     @staticmethod
     def _now_iso() -> str:
@@ -222,7 +236,7 @@ class QuantumVault:
 
     def initialize(self, master_password: str) -> None:
         """
-        First-time setup: create a new vault with a fresh quantum salt.
+        First-time setup: create a new vault with a fresh OS-generated salt.
 
         If the vault file already exists, this refuses to overwrite it.
         """
@@ -314,8 +328,14 @@ class QuantumVault:
             "q_salt": base64.b64encode(self._q_salt).decode("ascii"),
             "data": base64.b64encode(ciphertext).decode("ascii"),
         }
-        self.path.write_text(json.dumps(payload), encoding="utf-8")
-        self.backup_to_disk()
+        # Preserve the previous good generation before publishing the new one.
+        # The old vault remains untouched if either backup or staging fails.
+        try:
+            if self.exists():
+                self.backup_to_disk()
+            _atomic_write_bytes(self.path, json.dumps(payload).encode("utf-8"))
+        except OSError as exc:
+            raise QuantumVaultError("Vault save failed; previous vault preserved.") from exc
         
     def get_header_for_integrity(self) -> dict:
         """
@@ -355,7 +375,7 @@ class QuantumVault:
         # This will raise if old_password is wrong.
         self.unlock(old_password)
 
-        # Re-salt with fresh quantum randomness
+        # Re-salt using the OS CSPRNG
         self._q_salt = self._generate_q_salt()
         key = self._derive_key(new_password, self._q_salt)
         self._fernet = Fernet(key)

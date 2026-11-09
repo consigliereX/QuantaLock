@@ -71,6 +71,21 @@ python run_qpgen.py
 
 To launch the GUI: `python run_qpgen_gui.py`.
 
+## Vault write/recovery behavior
+
+Vault v1 now saves encrypted contents with a same-directory temporary file
+and atomic replacement. Before overwriting an existing vault it keeps a
+previous-generation encrypted `.bak` copy. Backup failure aborts the save.
+Recovery is explicit: `QuantumVault.restore_from_backup()` preserves the
+current file as a `.corrupt.*` snapshot and restores the previous generation.
+Restoring an older backup may require the master password valid at that time.
+
+**Important:** Existing v1 master-password/device-binding derivation is unchanged.
+Keep a separate secure backup of both the vault and `~/.qpgen_device_secret.bin`;
+changing kernel/hostname or losing the local device secret may still lock
+out an existing vault. Structural backup checks do not prove decryptability.
+Do not use this prototype for high-value credentials.
+
 ## Engineering priorities
 
 - Completed: the password generation path now uses an operating-system CSPRNG; quantum simulation is retained for demonstration metadata.
