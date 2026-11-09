@@ -1,12 +1,13 @@
 """
-Legacy v1 encrypted password vault.
+Encrypted password vault with versioned key derivation.
 
-New vault salts use OS CSPRNG. Existing stored salts remain unchanged.
-The encrypted key also depends on legacy device binding (see guard.py).
+New vaults use portable v2 keys derived from the master password and an OS
+CSPRNG salt. Existing v1 files retain device binding (see guard.py); they
+are never silently migrated.
 
 Vault file format (JSON text):
 {
-  "version": 1,
+  "version": 1 or 2,
   "q_salt": "<base64>",
   "data": "<base64 ciphertext>"
 }
@@ -85,8 +86,11 @@ def _default_vault_path() -> Path:
 
 
 VAULT_FILE = _default_vault_path()
-VAULT_VERSION = 1
-KDF_ITERATIONS = 300_000
+LEGACY_VAULT_VERSION = 1
+VAULT_VERSION = 2
+KDF_ITERATIONS = 300_000  # Legacy v1; never change for old vaults.
+PORTABLE_KDF_ITERATIONS = 600_000  # v2, master-password-only portability.
+SUPPORTED_VAULT_VERSIONS = (LEGACY_VAULT_VERSION, VAULT_VERSION)
 
 @dataclass
 class VaultEntry:
@@ -106,8 +110,8 @@ class QuantumVault:
     """
     Encrypted password vault.
 
-    Encryption key is PBKDF2-HMAC-SHA256(master password, bound salt),
-    encoded as urlsafe base64 for Fernet. Legacy v1 device binding retained.
+    Fernet with PBKDF2-HMAC-SHA256. V1 keys retain hardware binding;
+    new v2 keys are portable and derived only from master password + salt.
     """
 
     def __init__(self, path: Path | None = None) -> None:
@@ -116,6 +120,7 @@ class QuantumVault:
         self._entries: list[VaultEntry] = []
         self._q_salt: bytes | None = None
         self._hardware_binding = None
+        self._vault_version: int | None = None
 
     # ---------- backup helpers ----------
 
@@ -160,7 +165,7 @@ class QuantumVault:
                 return False
             data = bpath.read_bytes()
             payload = json.loads(data)
-            if not isinstance(payload, dict) or payload.get("version") != VAULT_VERSION:
+            if not isinstance(payload, dict) or payload.get("version") not in SUPPORTED_VAULT_VERSIONS:
                 return False
             if len(base64.b64decode(payload["q_salt"], validate=True)) != 32:
                 return False
@@ -232,11 +237,29 @@ class QuantumVault:
         )
         return base64.urlsafe_b64encode(dk)
 
+    def _derive_portable_key(self, master_password: str, q_salt: bytes) -> bytes:
+        """v2: PBKDF2-HMAC-SHA256, independent of hostname, kernel and device files."""
+        if not isinstance(q_salt, bytes) or len(q_salt) != 32:
+            raise QuantumVaultError("Invalid portable vault salt.")
+        dk = hashlib.pbkdf2_hmac(
+            "sha256", master_password.encode("utf-8"),
+            b"quantalock:v2:" + q_salt,
+            PORTABLE_KDF_ITERATIONS, dklen=32,
+        )
+        return base64.urlsafe_b64encode(dk)
+
+    def _key_for_version(self, master_password: str, q_salt: bytes, version: int) -> bytes:
+        if version == LEGACY_VAULT_VERSION:
+            return self._derive_key(master_password, q_salt)
+        if version == VAULT_VERSION:
+            return self._derive_portable_key(master_password, q_salt)
+        raise QuantumVaultError("Unsupported vault version.")
+
     # ---------- lifecycle ----------
 
     def initialize(self, master_password: str) -> None:
         """
-        First-time setup: create a new vault with a fresh OS-generated salt.
+        First-time setup: create a portable v2 vault with an OS-generated salt.
 
         If the vault file already exists, this refuses to overwrite it.
         """
@@ -244,7 +267,8 @@ class QuantumVault:
             raise QuantumVaultError("Vault already exists; cannot initialize.")
 
         self._q_salt = self._generate_q_salt()
-        key = self._derive_key(master_password, self._q_salt)
+        self._vault_version = VAULT_VERSION
+        key = self._key_for_version(master_password, self._q_salt, self._vault_version)
         self._fernet = Fernet(key)
         self._entries = []
         self.save()
@@ -267,7 +291,8 @@ class QuantumVault:
                 "Vault file is corrupted or in an old format."
             ) from exc
 
-        if payload.get("version") != VAULT_VERSION:
+        version = payload.get("version")
+        if type(version) is not int or version not in SUPPORTED_VAULT_VERSIONS:
             raise QuantumVaultError("Unsupported vault version.")
 
         try:
@@ -276,7 +301,7 @@ class QuantumVault:
         except Exception as exc:  # noqa: BLE001
             raise QuantumVaultError("Vault file is corrupted.") from exc
 
-        key = self._derive_key(master_password, q_salt)
+        key = self._key_for_version(master_password, q_salt, version)
         fernet = Fernet(key)
 
         try:
@@ -307,24 +332,28 @@ class QuantumVault:
         self._q_salt = q_salt
         self._fernet = fernet
         self._entries = [VaultEntry(**item) for item in raw_list]
+        self._vault_version = version
 
     def lock(self) -> None:
         """Forget entries and key in memory."""
         self._entries = []
         self._fernet = None
         self._q_salt = None
+        self._vault_version = None
 
     def save(self) -> None:
         """Encrypt current entries and write to disk."""
-        if self._fernet is None or self._q_salt is None:
+        if self._fernet is None or self._q_salt is None or self._vault_version is None:
             raise QuantumVaultError("Vault is locked; cannot save.")
+        if self._vault_version not in SUPPORTED_VAULT_VERSIONS:
+            raise QuantumVaultError("Unsupported vault version.")
 
         raw_list = [asdict(e) for e in self._entries]
         plaintext = json.dumps(raw_list, indent=2).encode("utf-8")
         ciphertext = self._fernet.encrypt(plaintext)
 
         payload = {
-            "version": VAULT_VERSION,
+            "version": self._vault_version,
             "q_salt": base64.b64encode(self._q_salt).decode("ascii"),
             "data": base64.b64encode(ciphertext).decode("ascii"),
         }
@@ -377,7 +406,7 @@ class QuantumVault:
 
         # Re-salt using the OS CSPRNG
         self._q_salt = self._generate_q_salt()
-        key = self._derive_key(new_password, self._q_salt)
+        key = self._key_for_version(new_password, self._q_salt, self._vault_version)
         self._fernet = Fernet(key)
 
         # Save entries with new key
