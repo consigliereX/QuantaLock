@@ -286,7 +286,7 @@ class GeneratorTab(QWidget):
         # Password length
         length_label = QLabel("Password length (characters)")
         self.length_spin = QSpinBox()
-        self.length_spin.setRange(6, 128)
+        self.length_spin.setRange(8, 128)
         self.length_spin.setValue(self.config.password_length)
         self.length_spin.setSingleStep(2)
 
@@ -459,9 +459,8 @@ class GeneratorTab(QWidget):
         self.password_field.setPlainText(final_password)
 
         self.status_label.setText(
-            f"Generated with {self.config.num_qubits} qubits, "
-            f"length {self.config.password_length}, "
-            f"entropy rounds {self.config.entropy_rounds}."
+            "Base password: OS CSPRNG; "
+            f"circuit demonstration: {self.config.num_qubits} qubits."
         )
 
         # Strength is computed on the final password (with memory word mixed in)
